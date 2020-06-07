@@ -1,1 +1,4 @@
 credentials.json
+.vscode
+.venv
+token.pickle
