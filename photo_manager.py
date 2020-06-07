@@ -34,7 +34,7 @@ def main(folder):
 
     if contentful_upload:
         collection_title = input("Please provide a title for the Photo Collection:").strip()
-        photo_links = []
+        photos = []
         collection_date = None
 
         client = contentful_management.Client(CONTENTFUL_MANAGEMENT_TOKEN)
@@ -127,24 +127,24 @@ def main(folder):
                         collection_date = datetime.datetime.strptime(image.datetime_original, '%Y:%m:%d %H:%M:%S').date()
 
                 contentful_upload = portfolio_space.uploads().create(os.fsdecode(filepath))
-                contentful_asset = master_env.assets().create(
-                    filename,
-                    {
-                        'fields': {
-                            'title': {
-                                "en-US": filename
-                            },
-                            'file': {
-                                'en-US': {
-                                    'fileName': filename,
-                                    'contentType': 'image/jpeg',
-                                    'uploadFrom': contentful_upload.to_link().to_json()
-                                }
+                asset_attributes = {
+                    'fields': {
+                        'title': {
+                            "en-US": filename
+                        },
+                        'file': {
+                            'en-US': {
+                                'fileName': filename,
+                                'contentType': 'image/jpeg',
+                                'uploadFrom': contentful_upload.to_link().to_json()
                             }
                         }
                     }
-                ).process()
-                photo_links.append(contentful_asset.to_link().to_json())
+                }
+                contentful_asset = master_env.assets().create(None, asset_attributes) # None lets API generate ID
+                contentful_asset = contentful_asset.process()  # Processing is an async task, so I need to wait to publish it
+
+                photos.append(contentful_asset)
                 print("Uploaded", filename, "to Contentful")
 
     if contentful_upload:
@@ -156,7 +156,7 @@ def main(folder):
                     'en-US': collection_title
                 },
                 'photos': {
-                    'en-US': photo_links
+                    'en-US': [item.to_link().to_json() for item in photos]
                 },
                 'description': {
                     'en-US': 'myDesc'
@@ -168,14 +168,18 @@ def main(folder):
                     'en-US': collection_date.isoformat()
                 },
                 'featuredImage': {
-                    'en-US': photo_links[0]
+                    'en-US': photos[0].to_link().to_json()
                 }
             }
         }
         new_photoCollection = master_env.entries().create(
-            collection_title,
+            None,
             photoCollection_attributes
-        )
+        ) # None lets API auto generate unique ID
+
+        for photo in photos:
+            master_env.assets().find(photo.id).publish()
+
         print("===== Contentful Photo Collection Upload Complete! =====")
     print("===== Upload to Drive Complete! =====")
 
