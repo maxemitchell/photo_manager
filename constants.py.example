@@ -1,0 +1,5 @@
+CONTENTFUL_MANAGEMENT_TOKEN = ""
+CONTENTFUL_SPACE_ID = ""
+SCOPES = ['https://www.googleapis.com/auth/drive.file']
+DRIVE_PATH = "D:/edited pics/"
+DRIVE_YEAR = "twenty twenty"
