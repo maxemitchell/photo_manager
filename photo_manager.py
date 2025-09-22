@@ -1,136 +1,148 @@
 import pickle
 import os.path
 import sys
-import datetime
-import contentful_management
 import platform
+import boto3
+from botocore.exceptions import ClientError
 from exif import Image
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.http import MediaFileUpload
-from constants import CONTENTFUL_MANAGEMENT_TOKEN, CONTENTFUL_SPACE_ID, SCOPES, DRIVE_PATH_WINDOWS, DRIVE_PATH_WSL, DRIVE_YEAR
+from constants import SCOPES, DRIVE_PATH_WINDOWS, DRIVE_PATH_WSL, DRIVE_YEAR, R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME
 
 
 def main(folder, drive_path):
-    """A personal Photo Manager for Contentful and Google Drive.
+    """A personal Photo Manager for Cloudflare R2 and Google Drive.
     Creates a Root Google Drive folder, along with a year and individual folder for the album.
-    Asks the user if they want to upload to Contentful as well, and if so asks for a collection Title.
+    Renames photos to numbered format and uploads to R2 bucket.
     """
 
-    contentful_upload = promptUser(
-        "Do you want to upload to Contentful? [Y/n]")
-    drive_upload = promptUser(
-        "Do you want to upload to Google Drive? [Y/n]")
+    r2_upload = promptUser("Do you want to upload to Cloudflare R2? [Y/n]")
+    drive_upload = promptUser("Do you want to upload to Google Drive? [Y/n]")
 
-    if contentful_upload:
-        collection_title = input("Please provide a title for the Photo Collection:").strip()
-        photos = []
-        collection_date = None
+    if not r2_upload and not drive_upload:
+        print("No uploads selected. Exiting.")
+        return
 
-        print("===== Authenticating Contentful =====")
+    # Initialize R2 client if needed
+    s3_client = None
+    if r2_upload:
         try:
-            client = contentful_management.Client(CONTENTFUL_MANAGEMENT_TOKEN)
-            portfolio_space = client.spaces().find(CONTENTFUL_SPACE_ID)
-            master_env = portfolio_space.environments().find('master')
-        except:
-            contentful_upload = False
-            print("!!!!! Authenticating Contentful Failed. Ensure the Management Token and Space ID are correct !!!!!")
+            s3_client = boto3.client(
+                's3',
+                endpoint_url=R2_ENDPOINT_URL,
+                aws_access_key_id=R2_ACCESS_KEY_ID,
+                aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                region_name='auto'
+            )
+            # Test connection
+            s3_client.head_bucket(Bucket=R2_BUCKET_NAME)
+            print("===== Connected to Cloudflare R2 =====")
+        except Exception as e:
+            print(f"!!!!! Failed to connect to R2: {e} !!!!!")
+            r2_upload = False
 
+    # Initialize Google Drive if needed
+    service = None
+    folder_id = None
     if drive_upload:
         service, folder_id = driveFolderSetup(folder)
+        if not service:
+            drive_upload = False
 
-    print("===== Iterating Through Photos =====")
-    directory = os.fsencode(drive_path + DRIVE_YEAR + "/" + folder)
+    if not r2_upload and not drive_upload:
+        print("All upload methods failed. Exiting.")
+        return
 
+    print("===== Processing Photos =====")
+    directory = os.path.join(drive_path, DRIVE_YEAR, folder)
+    
+    if not os.path.isdir(directory):
+        print(f"Directory {directory} does not exist.")
+        return
+
+    # Get all JPG files and sort them for consistent numbering
+    jpg_files = []
     for file in os.listdir(directory):
-        filename = os.fsdecode(file)
+        if file.upper().endswith(".JPG"):
+            jpg_files.append(file)
+    
+    jpg_files.sort()  # Sort for consistent numbering
+    
+    if not jpg_files:
+        print("No JPG files found in directory.")
+        return
 
-        if filename.endswith(".jpg"):
-            filepath = os.fsencode(
-                drive_path + DRIVE_YEAR + "/" + folder + "/" + filename)
+    print(f"Found {len(jpg_files)} JPG files")
 
-            if drive_upload:
-                photo_metadata = {
-                    'name': [filename],
-                    'parents': [folder_id]
-                }
-                photo_media = MediaFileUpload(filepath, mimetype='image/jpeg', resumable=True)
-                request = service.files().create(media_body=photo_media, body=photo_metadata)
-
-                response = None
-                while response is None:
-                    status, response = request.next_chunk()
-                    if status:
-                        print("Uploaded", int(status.progress() * 100))
-                print("Uploaded", filename, "to Google Drive")
-
-            if contentful_upload:
-                if not collection_date:
-                    with open(os.fsdecode(filepath), 'rb') as image_file:
-                        image = Image(image_file)
-                        collection_date = datetime.datetime.strptime(image.datetime_original, '%Y:%m:%d %H:%M:%S').date()
-
-                try:
-                    contentful_upload = portfolio_space.uploads().create(os.fsdecode(filepath))
-                    asset_attributes = {
-                        'fields': {
-                            'title': {
-                                "en-US": filename
-                            },
-                            'file': {
-                                'en-US': {
-                                    'fileName': filename,
-                                    'contentType': 'image/jpeg',
-                                    'uploadFrom': contentful_upload.to_link().to_json()
-                                }
-                            }
-                        }
-                    }
-                    contentful_asset = master_env.assets().create(None, asset_attributes) # None lets API generate ID
-                    contentful_asset = contentful_asset.process()  # Processing is an async task, so I need to wait to publish it
-
-                except:
-                    print('!!!!! Error Uploading Contentful Asset:', filename)
-                else:
-                    photos.append(contentful_asset)
-                    print("Uploaded", filename, "to Contentful")
-
-    if contentful_upload:
-        print("===== Creating Contentful Photo Collection =====")
-        photoCollection_attributes = {
-            'content_type_id': 'photoCollection',
-            'fields': {
-                'title': {
-                    'en-US': collection_title
-                },
-                'photos': {
-                    'en-US': [item.to_link().to_json() for item in photos]
-                },
-                'collectionDate': {
-                    'en-US': collection_date.isoformat()
-                },
-                'featuredImage': {
-                    'en-US': photos[0].to_link().to_json()
-                }
-            }
-        }
+    # Check existing R2 files if uploading to R2
+    existing_r2_files = set()
+    if r2_upload:
         try:
-            new_photoCollection = master_env.entries().create(
-                None,
-                photoCollection_attributes
-            ) # None lets API auto generate unique ID
-        except:
-            print('!!!!! Error Creating Contentful Photo Collection !!!!!')
+            r2_prefix = f"photo_collections/{folder}/"
+            response = s3_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=r2_prefix)
+            if 'Contents' in response:
+                existing_r2_files = {obj['Key'].split('/')[-1] for obj in response['Contents']}
+            print(f"Found {len(existing_r2_files)} existing files in R2")
+        except Exception as e:
+            print(f"Warning: Could not check existing R2 files: {e}")
 
-        print("===== Publishing Uploaded Contentful Images =====")
-        for photo in photos:
-            try:
-                master_env.assets().find(photo.id).publish()
-            except:
-                print('!!!!! Error Publishing Contentful Asset:', photo.file.fileName)
+    # Process each photo
+    for index, filename in enumerate(jpg_files, 1):
+        filepath = os.path.join(directory, filename)
+        new_filename = f"{index}.jpg"
+        
+        print(f"Processing {filename} -> {new_filename}")
 
-        print("===== Contentful Upload and Publish Complete! =====")
+        # Upload to R2 if requested
+        if r2_upload:
+            r2_key = f"photo_collections/{folder}/{new_filename}"
+            
+            if new_filename not in existing_r2_files:
+                try:
+                    s3_client.upload_file(
+                        filepath, 
+                        R2_BUCKET_NAME, 
+                        r2_key,
+                        ExtraArgs={'ContentType': 'image/jpeg'}
+                    )
+                    print(f"Uploaded {new_filename} to R2")
+                except Exception as e:
+                    print(f"!!!!! Error uploading {new_filename} to R2: {e}")
+            else:
+                print(f"File {new_filename} already exists in R2. Skipping.")
+
+        # Upload to Google Drive if requested
+        if drive_upload:
+            # Check if file already exists in Google Drive
+            file_exists = service.files().list(
+                q=f"name='{new_filename}' and '{folder_id}' in parents",
+                spaces='drive',
+                fields='files(id, name)'
+            ).execute()
+            
+            if not file_exists.get('files', []):
+                try:
+                    photo_metadata = {
+                        'name': new_filename,
+                        'parents': [folder_id]
+                    }
+                    photo_media = MediaFileUpload(filepath, mimetype='image/jpeg', resumable=True)
+                    request = service.files().create(media_body=photo_media, body=photo_metadata)
+
+                    response = None
+                    while response is None:
+                        status, response = request.next_chunk()
+                        if status:
+                            print(f"Uploaded {int(status.progress() * 100)}%")
+                    print(f"Uploaded {new_filename} to Google Drive")
+                except Exception as e:
+                    print(f"!!!!! Error uploading {new_filename} to Google Drive: {e}")
+            else:
+                print(f"File {new_filename} already exists in Google Drive. Skipping.")
+
+    print("===== Upload Complete! =====")
 
 
 def driveFolderSetup(folder):
@@ -138,14 +150,14 @@ def driveFolderSetup(folder):
     try:
         creds = authenticateGoogleDrive(None)
         service = build('drive', 'v3', credentials=creds)
-    except:
-        print("!!!!! Authenticating Google Drive Failed !!!!!")
-        return
+    except Exception as e:
+        print(f"!!!!! Authenticating Google Drive Failed: {e} !!!!!")
+        return None, None
 
     print('===== Finding Google Drive Root Folder =====')
     root_response = service.files().list(q="mimeType = 'application/vnd.google-apps.folder' and name='managed_photos'",
-                                            spaces='drive',
-                                            fields='nextPageToken, files(id, name)').execute()
+                                        spaces='drive',
+                                        fields='nextPageToken, files(id, name)').execute()
     root_files = root_response.get('files', [])
 
     if not root_files:
@@ -155,7 +167,7 @@ def driveFolderSetup(folder):
             'mimeType': 'application/vnd.google-apps.folder'
         }
         root = service.files().create(body=root_metadata,
-                                        fields='id').execute()
+                                    fields='id').execute()
         root_id = root.get('id')
         print('Google Drive Root Folder Created with ID: ', root_id)
     else:
@@ -163,36 +175,45 @@ def driveFolderSetup(folder):
         print('Found Google Drive Root Folder:', root_id)
 
     print('===== Finding Google Drive Year Folder =====')
-    year_response = service.files().list(q="mimeType = 'application/vnd.google-apps.folder' and name='"+DRIVE_YEAR+"'",
-                                            spaces='drive',
-                                            fields='nextPageToken, files(id, name)').execute()
+    year_response = service.files().list(q=f"mimeType = 'application/vnd.google-apps.folder' and name='{DRIVE_YEAR}' and '{root_id}' in parents",
+                                        spaces='drive',
+                                        fields='nextPageToken, files(id, name)').execute()
     year_files = year_response.get('files', [])
 
     if not year_files:
         print("===== Creating Google Drive Year Folder =====")
         year_metadata = {
-            'name': [DRIVE_YEAR],
+            'name': DRIVE_YEAR,
             'mimeType': 'application/vnd.google-apps.folder',
             'parents': [root_id]
         }
         year_folder = service.files().create(body=year_metadata,
-                                                fields='id').execute()
+                                            fields='id').execute()
         year_id = year_folder.get('id')
         print('Google Drive Year Folder Created with ID: ', year_id)
     else:
         year_id = year_files[0].get('id')
         print('Found Year Folder:', year_id)
 
-    print("===== Creating Provided Folder in Google Drive =====")
-    folder_metadata = {
-        'name': [folder],
-        'mimeType': 'application/vnd.google-apps.folder',
-        'parents': [year_id]
-    }
-    drive_folder = service.files().create(body=folder_metadata,
-                                            fields='id').execute()
-    folder_id = drive_folder.get('id')
-    print('Folder Created with ID: ', folder_id)
+    print("===== Finding or Creating Provided Folder in Google Drive =====")
+    folder_response = service.files().list(q=f"mimeType = 'application/vnd.google-apps.folder' and name='{folder}' and '{year_id}' in parents",
+                                           spaces='drive',
+                                           fields='nextPageToken, files(id, name)').execute()
+    folder_files = folder_response.get('files', [])
+
+    if not folder_files:
+        folder_metadata = {
+            'name': folder,
+            'mimeType': 'application/vnd.google-apps.folder',
+            'parents': [year_id]
+        }
+        drive_folder = service.files().create(body=folder_metadata,
+                                             fields='id').execute()
+        folder_id = drive_folder.get('id')
+        print('Folder Created with ID: ', folder_id)
+    else:
+        folder_id = folder_files[0].get('id')
+        print('Found existing folder:', folder_id)
 
     return service, folder_id
 
@@ -241,7 +262,7 @@ if __name__ == '__main__':
         else:
             drive_path = DRIVE_PATH_WSL
 
-        if os.path.isdir(drive_path + DRIVE_YEAR + "/" + sys.argv[1]):
+        if os.path.isdir(os.path.join(drive_path, DRIVE_YEAR, sys.argv[1])):
             main(sys.argv[1], drive_path)
         else:
             print("Please provide a folder that exists.")

@@ -4,3 +4,4 @@ credentials.json
 token.pickle
 constants.py
 __pycache__
+.DS_Store

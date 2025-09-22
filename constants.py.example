@@ -1,6 +1,10 @@
-CONTENTFUL_MANAGEMENT_TOKEN = ""
-CONTENTFUL_SPACE_ID = ""
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
-DRIVE_PATH = "D:/edited pics/"
+DRIVE_PATH_WINDOWS = "D:/edited pics/"
 DRIVE_PATH_WSL = "/mnt/d/edited pics/"
 DRIVE_YEAR = "twenty twenty"
+
+# Cloudflare R2 Configuration
+R2_ENDPOINT_URL = "https://<account_id>.r2.cloudflarestorage.com"
+R2_ACCESS_KEY_ID = ""
+R2_SECRET_ACCESS_KEY = ""
+R2_BUCKET_NAME = ""
